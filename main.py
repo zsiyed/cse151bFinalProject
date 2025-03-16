@@ -3,24 +3,26 @@ import torch
 import numpy as np
 from datasets import load_dataset
 from transformers import (AutoTokenizer, AutoModelForCausalLM, TrainingArguments, 
-                          Trainer, DataCollatorForLanguageModeling, set_seed, TrainerCallback)
+                          Trainer, DataCollatorForLanguageModeling, set_seed, TrainerCallback, BitsAndBytesConfig)
 from peft import LoraConfig, get_peft_model
 
 # For reproducibility
 set_seed(42)
-
+torch.cuda.empty_cache() 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # ----------------------------
 # 1. Data Loading and Splitting
 # ----------------------------
 dataset = load_dataset("json", data_files="data/processed_quotes.json")["train"]
-split_dataset = dataset.train_test_split(test_size=0.2, seed=42)
+split_dataset = dataset.train_test_split(test_size=0.01, seed=42)
 train_dataset = split_dataset["train"]
 eval_dataset = split_dataset["test"]
 
 # ----------------------------
 # 2. Tokenization
 # ----------------------------
-model_name = "BEE-spoke-data/smol_llama-101M-GQA"
+# model_name = "BEE-spoke-data/smol_llama-101M-GQA"
+model_name = "Maykeye/TinyLLama-v0"
 tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 tokenizer.pad_token = tokenizer.eos_token
 
@@ -48,14 +50,27 @@ data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 # ----------------------------
 # 4. Model Setup and LoRA Fine-Tuning
 # ----------------------------
-model = AutoModelForCausalLM.from_pretrained(model_name)
+# model = AutoModelForCausalLM.from_pretrained(model_name)
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,  # or torch.bfloat16
+    bnb_4bit_use_double_quant=True,
+    llm_int8_enable_fp32_cpu_offload=True
+)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    quantization_config=bnb_config,
+    device_map="auto"
+)
 lora_config = LoraConfig(
     r=8,
     lora_alpha=32,
     target_modules=["q_proj", "v_proj"],
     lora_dropout=0.1,
     bias="none",
-    task_type="CAUSAL_LM"
+    task_type="CAUSAL_LM",
+    # inference_mode=True
 )
 model = get_peft_model(model, lora_config)
 
@@ -74,7 +89,28 @@ class GradientLogger(TrainerCallback):
 
 # ----------------------------
 # 6. Training Setup with Modified Hyperparameters
-# ----------------------------
+# 
+
+# training_args = TrainingArguments(
+#     output_dir="./lora_smol_llama_finetuned",
+#     per_device_train_batch_size=4,
+#     per_device_eval_batch_size=1,
+#     num_train_epochs=5,           # Increased number of epochs
+#     learning_rate=1e-3,           # Increased learning rate
+#     lr_scheduler_type="cosine",
+#     logging_steps=10,
+#     save_steps=50,
+#     save_total_limit=2,
+#     fp16=True if torch.cuda.is_available() else False,
+#     evaluation_strategy="steps",
+#     eval_steps=50,
+#     eval_accumulation_steps=2,
+#     load_best_model_at_end=True,
+#     metric_for_best_model="accuracy",
+#     greater_is_better=True,
+# )
+
+
 training_args = TrainingArguments(
     output_dir="./lora_smol_llama_finetuned",
     per_device_train_batch_size=4,
@@ -85,14 +121,15 @@ training_args = TrainingArguments(
     logging_steps=10,
     save_steps=50,
     save_total_limit=2,
-    fp16=True if torch.cuda.is_available() else False,
-    evaluation_strategy="steps",
+    fp16=False,
+    bf16=True if torch.cuda.is_bf16_supported() else False,    evaluation_strategy="steps",
     eval_steps=50,
     eval_accumulation_steps=2,
     load_best_model_at_end=True,
     metric_for_best_model="accuracy",
     greater_is_better=True,
 )
+
 
 # ----------------------------
 # 7. Metrics Calculation
@@ -119,6 +156,13 @@ trainer = Trainer(
     compute_metrics=compute_metrics,
     callbacks=[GradientLogger]
 )
+
+def safe_evaluate(trainer):
+    model.eval()  # Set model to evaluation mode
+    with torch.no_grad():  # Prevent gradient storage
+        eval_results = trainer.evaluate()
+    model.train()  # Set model back to training mode
+    return eval_results
 
 trainer.train()
 eval_results = trainer.evaluate()
