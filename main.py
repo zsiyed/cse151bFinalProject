@@ -2,9 +2,7 @@ import os
 import torch
 import numpy as np
 from datasets import load_dataset
-from transformers import (AutoTokenizer, AutoModelForCausalLM, TrainingArguments, 
-                          Trainer, DataCollatorForLanguageModeling, set_seed, TrainerCallback, BitsAndBytesConfig)
-from peft import LoraConfig, get_peft_model
+from transformers import GPT2Tokenizer, GPT2LMHeadModel, Trainer, TrainingArguments, DataCollatorForLanguageModeling, set_seed
 
 # For reproducibility
 set_seed(42)
@@ -21,23 +19,16 @@ eval_dataset = split_dataset["test"]
 # ----------------------------
 # 2. Tokenization
 # ----------------------------
-# model_name = "BEE-spoke-data/smol_llama-101M-GQA"
-model_name = "Maykeye/TinyLLama-v0"
-tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+model_name = "gpt2"
+tokenizer = GPT2Tokenizer.from_pretrained(model_name)
 tokenizer.pad_token = tokenizer.eos_token
+model = GPT2LMHeadModel.from_pretrained(model_name)
 
 def tokenize_function(examples):
-    if "quote" in examples:
-        key = "quote"
-    elif "text" in examples:
-        key = "text"
-    else:
-        key = list(examples.keys())[0]
-    prompts = [
-        "Generate a personalized motivational quote for [user_input].\n" + quote
-        for quote in examples[key]
-    ]
-    return tokenizer(prompts, truncation=True, max_length=512, padding="max_length")
+    tokenized_output = tokenizer(examples["text"], padding="max_length", truncation=True, max_length=50)
+    tokenized_output["labels"] = tokenized_output["input_ids"].copy()  # Ensure labels are set
+    return tokenized_output
+
 
 train_dataset = train_dataset.map(tokenize_function, batched=True, remove_columns=train_dataset.column_names)
 eval_dataset = eval_dataset.map(tokenize_function, batched=True, remove_columns=eval_dataset.column_names)
@@ -52,84 +43,14 @@ data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 # ----------------------------
 # model = AutoModelForCausalLM.from_pretrained(model_name)
 
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,  # or torch.bfloat16
-    bnb_4bit_use_double_quant=True,
-    llm_int8_enable_fp32_cpu_offload=True
-)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    quantization_config=bnb_config,
-    device_map="auto"
-)
-lora_config = LoraConfig(
-    r=8,
-    lora_alpha=32,
-    target_modules=["q_proj", "v_proj"],
-    lora_dropout=0.1,
-    bias="none",
-    task_type="CAUSAL_LM",
-    # inference_mode=True
-)
-model = get_peft_model(model, lora_config)
-
-# ----------------------------
-# 5. Custom Callback for Gradient Logging
-# ----------------------------
-class GradientLogger(TrainerCallback):
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if state.global_step % args.logging_steps == 0 and model is not None:
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    total_norm += p.grad.data.norm(2).item() ** 2
-            total_norm = total_norm ** 0.5
-            print(f"Step {state.global_step}: Gradient Norm = {total_norm:.4f}")
-
-# ----------------------------
-# 6. Training Setup with Modified Hyperparameters
-# 
-
-# training_args = TrainingArguments(
-#     output_dir="./lora_smol_llama_finetuned",
-#     per_device_train_batch_size=4,
-#     per_device_eval_batch_size=1,
-#     num_train_epochs=5,           # Increased number of epochs
-#     learning_rate=1e-3,           # Increased learning rate
-#     lr_scheduler_type="cosine",
-#     logging_steps=10,
-#     save_steps=50,
-#     save_total_limit=2,
-#     fp16=True if torch.cuda.is_available() else False,
-#     evaluation_strategy="steps",
-#     eval_steps=50,
-#     eval_accumulation_steps=2,
-#     load_best_model_at_end=True,
-#     metric_for_best_model="accuracy",
-#     greater_is_better=True,
-# )
-
-
 training_args = TrainingArguments(
-    output_dir="./lora_smol_llama_finetuned",
+    output_dir="./quote_generator",
     per_device_train_batch_size=4,
-    per_device_eval_batch_size=1,
-    num_train_epochs=5,           # Increased number of epochs
-    learning_rate=1e-3,           # Increased learning rate
-    lr_scheduler_type="cosine",
-    logging_steps=10,
-    save_steps=50,
+    num_train_epochs=3,
+    save_steps=500,
     save_total_limit=2,
-    fp16=False,
-    bf16=True if torch.cuda.is_bf16_supported() else False,    evaluation_strategy="steps",
-    eval_steps=50,
-    eval_accumulation_steps=2,
-    load_best_model_at_end=True,
-    metric_for_best_model="accuracy",
-    greater_is_better=True,
+    logging_dir="./logs",
 )
-
 
 # ----------------------------
 # 7. Metrics Calculation
@@ -150,12 +71,11 @@ def compute_metrics(eval_pred):
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=train_dataset,
+    train_dataset=train_dataset,  # Fix: Use train_dataset instead of tokenized_dataset
     eval_dataset=eval_dataset,
     data_collator=data_collator,
-    compute_metrics=compute_metrics,
-    callbacks=[GradientLogger]
 )
+
 
 def safe_evaluate(trainer):
     model.eval()  # Set model to evaluation mode
@@ -168,5 +88,5 @@ trainer.train()
 eval_results = trainer.evaluate()
 print("Final evaluation results:", eval_results)
 
-model.save_pretrained("./lora_smol_llama_finetuned")
-print("Model saved to ./lora_smol_llama_finetuned")
+model.save_pretrained("./saved_gpt2")
+print("Model saved to ./saved_gpt2")
